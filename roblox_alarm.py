@@ -5,6 +5,7 @@ Kullanıcının belirlediği boss sayısına ulaşıldığında veya Y == Z oldu
 """
 
 import tkinter as tk
+from tkinter import filedialog
 import threading
 import time
 import re
@@ -27,31 +28,68 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ─────────────────────────────────────────────
-#  PARSER
+#  PARSER & BİLDİRİM
 # ─────────────────────────────────────────────
 
 PATTERNS = [
-    re.compile(r'rebirth\s*\d+[\s\:\-\.\|]*(\d+)\s*[/\\|\s]+(\d+)\s*boss', re.IGNORECASE),
+    re.compile(r'rebirth\s*\d+[\s\:\-\.\|]*(\d+)\s*[/\\|\s]+(\d+)', re.IGNORECASE),
     re.compile(r'(\d+)\s*[/\\|]\s*(\d+)\s*boss', re.IGNORECASE),
     re.compile(r'(\d+)\s*[/\\|]\s*(\d+)', re.IGNORECASE),
+    re.compile(r'(\d+)\s*of\s*(\d+)', re.IGNORECASE),
 ]
+
+def clean_ocr_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.lower().replace('\n', ' ')
+    # OCR karakter düzeltmeleri: l, i, I -> 1 (sayıların içinde/yanında)
+    t = re.sub(r'(?<=\d)[iIl](?=\d)', '1', t)
+    t = re.sub(r'\b[iIl](?=\d)', '1', t)
+    t = re.sub(r'(?<=\d)[iIl]\b', '1', t)
+    # Ayrıştırıcı karakterleri standardize et
+    t = t.replace('|', '/').replace('\\', '/')
+    return t
 
 def parse_boss_text(text: str):
     if not text:
         return None
     
-    clean_text = text.lower().replace('\n', ' ')
+    clean_text = clean_ocr_text(text)
     for pat in PATTERNS:
         match = pat.search(clean_text)
         if match:
             try:
                 curr = int(match.group(1))
                 tot = int(match.group(2))
-                if curr <= tot and tot > 0:
+                if curr > 0 and tot > 0 and curr < 1000 and tot < 1000:
                     return curr, tot
             except ValueError:
                 continue
     return None
+
+def send_windows_notification(title: str, message: str):
+    """Windows Sistem Bildirimi (Toast / Balloon) Gönderir"""
+    def _notify():
+        try:
+            ps_script = (
+                f'[reflection.assembly]::LoadWithPartialName("System.Windows.Forms") | Out-Null; '
+                f'$n = New-Object System.Windows.Forms.NotifyIcon; '
+                f'$n.Icon = [System.Drawing.SystemIcons]::Information; '
+                f'$n.Visible = $true; '
+                f'$n.ShowBalloonTip(10000, "{title}", "{message}", [System.Windows.Forms.ToolTipIcon]::Info); '
+                f'Start-Sleep -Seconds 6; '
+                f'$n.Dispose()'
+            )
+            import subprocess
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script],
+                creationflags=0x08000000,
+                timeout=10
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_notify, daemon=True).start()
 
 
 # ─────────────────────────────────────────────
@@ -117,10 +155,117 @@ class RegionSelector:
 #  ALARM
 # ─────────────────────────────────────────────
 
-def play_alarm(stop_event: threading.Event):
-    while not stop_event.is_set():
-        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-        time.sleep(0.6)
+def play_audio_file(filepath: str, stop_event: threading.Event):
+    """MP3 ve WAV dosyalarını Windows MCI veya winsound ile döngüsel çalar."""
+    if not filepath or not os.path.exists(filepath):
+        return False
+    
+    ext = os.path.splitext(filepath)[1].lower()
+    
+    if ext == '.mp3':
+        try:
+            winmm = ctypes.windll.winmm
+            abs_path = os.path.abspath(filepath)
+            alias = f"alarm_{int(time.time() * 1000)}"
+            
+            # MCI ile MP3 aç
+            open_cmd = f'open "{abs_path}" type mpegvideo alias {alias}'
+            winmm.mciSendStringW(open_cmd, None, 0, None)
+            
+            # Süre bilgisini al (ms cinsinden)
+            buf = ctypes.create_unicode_buffer(128)
+            winmm.mciSendStringW(f'status {alias} length', buf, 128, None)
+            try:
+                duration_ms = int(buf.value)
+            except (ValueError, TypeError):
+                duration_ms = 3000  # bilinmiyorsa 3 saniye varsay
+            
+            # Minimum 8 saniye çalmak için kaç kez döngü gerektiğini hesapla
+            min_duration_ms = 8000
+            repeat_count = max(1, -(-min_duration_ms // duration_ms))  # ceiling division
+            
+            # Her döngüde yeniden başlat (MCI repeat bazen kısa dosyalarda çalışmaz)
+            loops_done = 0
+            while not stop_event.is_set():
+                winmm.mciSendStringW(f'play {alias} from 0', None, 0, None)
+                loops_done += 1
+                
+                # Dosyanın bitmesini bekle (stop_event yoksa)
+                elapsed = 0
+                while not stop_event.is_set() and elapsed < duration_ms:
+                    time.sleep(0.1)
+                    elapsed += 100
+                
+                # Minimum 8 saniye doldu ve event set edildiyse çık
+                if stop_event.is_set():
+                    break
+                
+                # Eğer henüz 8 saniye dolmadıysa bir sonraki döngüye gir
+                if loops_done >= repeat_count:
+                    # 8 saniye doldu, stop_event beklemeye devam et
+                    while not stop_event.is_set():
+                        time.sleep(0.1)
+                    break
+            
+            winmm.mciSendStringW(f'stop {alias}', None, 0, None)
+            winmm.mciSendStringW(f'close {alias}', None, 0, None)
+            return True
+        except Exception:
+            return False
+    elif ext == '.wav':
+        try:
+            winsound.PlaySound(filepath, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+            while not stop_event.is_set():
+                time.sleep(0.1)
+            winsound.PlaySound(None, winsound.SND_PURGE)
+            return True
+        except Exception:
+            return False
+    return False
+
+def play_alarm(stop_event: threading.Event, custom_sound_path: str = None):
+    # 1. Öncelik: Seçilen veya klasördeki finishsound.mp3 / alarm.mp3 / alarm.wav
+    sound_path = custom_sound_path
+    if not sound_path or not os.path.exists(sound_path):
+        for f in ["finishsound.mp3", "alarm.mp3", "alarm.wav", "sound.wav"]:
+            p = os.path.join(SCRIPT_DIR, f)
+            if os.path.exists(p):
+                sound_path = p
+                break
+
+    if sound_path and os.path.exists(sound_path):
+        # Özel ses dosyası varsa sadece onu çal — Windows beep YOK
+        play_audio_file(sound_path, stop_event)
+    else:
+        # Özel ses yoksa varsayılan Windows alarmını çal + beep döngüsü
+        try:
+            default_wav = r"C:\Windows\Media\Alarm01.wav"
+            if os.path.exists(default_wav):
+                winsound.PlaySound(default_wav, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+            else:
+                winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_LOOP)
+        except Exception:
+            pass
+
+        while not stop_event.is_set():
+            try:
+                winsound.Beep(1200, 400)
+                time.sleep(0.2)
+                winsound.Beep(1500, 400)
+                time.sleep(0.4)
+            except Exception:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                time.sleep(0.8)
+
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
+
+
+
 
 
 # ─────────────────────────────────────────────
@@ -165,6 +310,18 @@ class RobloxAlarmApp:
         self.alarm_stop   = threading.Event()
         self.ocr_reader   = screen_ocr.Reader.create_quality_reader()
         self.preview_img  = None
+        self.custom_sound_path = None
+        
+        # Klasörde Varsayılan finishsound.mp3 / alarm.mp3 / alarm.wav Var mı Kontrol Et
+        for f in ["finishsound.mp3", "alarm.mp3", "alarm.wav", "sound.wav"]:
+            p = os.path.join(SCRIPT_DIR, f)
+            if os.path.exists(p):
+                self.custom_sound_path = p
+                break
+        
+        # Thread-safe cache — scan thread bu değerleri okur (tkinter thread-safe değil)
+        self._cached_target_boss   = None   # None = auto mod
+        self._cached_scan_interval = 10.0
         
         # Canlı Geri Sayım Zamanlayıcısı Değişkenleri
         self.current_remaining = 0.0
@@ -175,8 +332,8 @@ class RobloxAlarmApp:
     def _build_gui(self):
         self.root = tk.Tk()
         self.root.title('Roblox Boss Alarm')
-        self.root.geometry('520x760')
-        self.root.minsize(450, 600)  # Esnetilebilir min boyut
+        self.root.geometry('530x800')
+        self.root.minsize(450, 650)  # Esnetilebilir min boyut
         self.root.resizable(True, True)  # Pencere boyutu değiştirilebilir
         self.root.configure(bg='#0d1117')
 
@@ -228,7 +385,7 @@ class RobloxAlarmApp:
             command=self._run_debug
         ).pack(side='left')
 
-        # ── AYARLAR KARTI (Hedef Boss & Süre) ──
+        # ── AYARLAR KARTI (Hedef Boss & Süre & Ses) ──
         ac = tk.Frame(self.root, bg='#161b22')
         ac.pack(fill='x', padx=20, pady=5)
 
@@ -273,7 +430,7 @@ class RobloxAlarmApp:
         tk.Label(custom_row, text='Boss (Örn: 19, 22)', bg='#161b22', fg='#8b949e', font=('Segoe UI', 8)).pack(side='left')
 
         interval_row = tk.Frame(ac, bg='#161b22')
-        interval_row.pack(anchor='w', padx=14, pady=(4,10))
+        interval_row.pack(anchor='w', padx=14, pady=(2,4))
 
         tk.Label(interval_row, text='⏱️ Tarama Sıklığı:', bg='#161b22', fg='#c9d1d9', font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0,6))
         
@@ -286,6 +443,33 @@ class RobloxAlarmApp:
         self.interval_entry.pack(side='left', padx=4)
 
         tk.Label(interval_row, text='saniyede bir tara', bg='#161b22', fg='#8b949e', font=('Segoe UI', 9)).pack(side='left')
+
+        # --- Ses Dosyası Seçim Satırı ---
+        sound_row = tk.Frame(ac, bg='#161b22')
+        sound_row.pack(anchor='w', padx=14, pady=(4,10))
+
+        tk.Label(sound_row, text='🔊 Alarm Sesi:', bg='#161b22', fg='#c9d1d9', font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0,6))
+
+        initial_sound_text = f'Özel: {os.path.basename(self.custom_sound_path)}' if self.custom_sound_path else 'Varsayılan (Alarm01.wav)'
+        self.sound_var = tk.StringVar(value=initial_sound_text)
+        tk.Label(sound_row, textvariable=self.sound_var, bg='#161b22', fg='#00ffcc', font=('Segoe UI', 8, 'bold'), width=24, anchor='w').pack(side='left', padx=2)
+
+        tk.Button(
+            sound_row, text='🎵 Ses Seç (.wav)',
+            bg='#21262d', fg='#c9d1d9', activebackground='#30363d',
+            relief='flat', bd=0, padx=8, pady=3,
+            font=('Segoe UI', 8, 'bold'), cursor='hand2',
+            command=self._select_sound
+        ).pack(side='left', padx=4)
+
+        tk.Button(
+            sound_row, text='▶ Test',
+            bg='#238636', fg='white', activebackground='#2ea043',
+            relief='flat', bd=0, padx=8, pady=3,
+            font=('Segoe UI', 8, 'bold'), cursor='hand2',
+            command=self._test_sound
+        ).pack(side='left', padx=2)
+
 
 
         # ── OCR & İLERLEME KARTI ──
@@ -479,6 +663,8 @@ class RobloxAlarmApp:
 
     # ── Başlat / Durdur ──────────────────────
 
+    # ── Başlat / Durdur ──────────────────────
+
     def _start(self):
         if not self.region:
             self._set_status('⚠ Önce ekran bölgesi seçin!', '#f85149')
@@ -491,6 +677,7 @@ class RobloxAlarmApp:
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         self.mute_btn.config(state='disabled')
+        
         interval = self._get_scan_interval()
         self._set_status(f'🔍 Taranıyor... (Her {interval:.0f} saniyede bir)', '#58a6ff')
 
@@ -512,6 +699,14 @@ class RobloxAlarmApp:
     def _mute_alarm(self):
         self.alarm_stop.set()
         self.alarm_active = False
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        try:
+            self.root.attributes('-topmost', False)
+        except Exception:
+            pass
         self.mute_btn.config(state='disabled')
         self.root.configure(bg='#0d1117')
 
@@ -584,11 +779,58 @@ class RobloxAlarmApp:
                 interval = self._get_scan_interval()
                 self._set_status(f'🔍 Taranıyor... (Metin okunamadı — {interval:.0f}s)', '#8b949e')
 
+    def _select_sound(self):
+        file_path = filedialog.askopenfilename(
+            title="Özel Alarm Sesi Seç (.mp3 veya .wav)",
+            filetypes=[
+                ("Ses Dosyaları (*.mp3, *.wav)", "*.mp3;*.wav"),
+                ("MP3 Dosyaları (*.mp3)", "*.mp3"),
+                ("WAV Dosyaları (*.wav)", "*.wav"),
+                ("Tüm Dosyalar", "*.*")
+            ]
+        )
+        if file_path:
+            self.custom_sound_path = file_path
+            filename = os.path.basename(file_path)
+            self.sound_var.set(f'Özel: {filename}')
+            self._set_status(f'Özel ses seçildi: {filename}', '#3fb950')
+
+    def _test_sound(self):
+        self._set_status('🔊 Ses test ediliyor (3 saniye)...', '#e3b341')
+        def run_test():
+            test_stop = threading.Event()
+            t = threading.Thread(target=play_alarm, args=(test_stop, self.custom_sound_path), daemon=True)
+            t.start()
+            time.sleep(3.0)
+            test_stop.set()
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+            self.root.after(0, self._set_status, 'Ses testi tamamlandı.', '#3fb950')
+        threading.Thread(target=run_test, daemon=True).start()
+
     def _trigger_alarm(self, current: int, target: int):
         self._set_status(f'🔔 ALARM! Hedef Boss Tamamlandı ({current}/{target})!', '#f85149')
         self.mute_btn.config(state='normal')
         self.alarm_stop.clear()
-        threading.Thread(target=play_alarm, args=(self.alarm_stop,), daemon=True).start()
+        
+        # 1. Windows Masaüstü / Toast Bildirimi Gönder
+        send_windows_notification(
+            'Roblox Boss Alarm 🔔',
+            f'Tebrikler! Boss hedefine ulaşıldı: {current}/{target} Boss!'
+        )
+        
+        # 2. Pencereyi Öne Getir & Ekranın Üstüne Al
+        try:
+            self.root.attributes('-topmost', True)
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+
+        # 3. Alarm Sesini Başlat (Özel ses seçildiyse onu kullanır)
+        threading.Thread(target=play_alarm, args=(self.alarm_stop, self.custom_sound_path), daemon=True).start()
         self._flash_window()
 
     def _flash_window(self, count=0):
@@ -606,8 +848,14 @@ class RobloxAlarmApp:
     def _on_close(self):
         self.running = False
         self.alarm_stop.set()
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
         self.root.destroy()
 
 
 if __name__ == '__main__':
     RobloxAlarmApp()
+
+
