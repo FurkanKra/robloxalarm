@@ -176,7 +176,8 @@ class RobloxAlarmApp:
         self.root = tk.Tk()
         self.root.title('Roblox Boss Alarm')
         self.root.geometry('520x760')
-        self.root.resizable(False, False)
+        self.root.minsize(450, 600)  # Esnetilebilir min boyut
+        self.root.resizable(True, True)  # Pencere boyutu değiştirilebilir
         self.root.configure(bg='#0d1117')
 
         # Başlık
